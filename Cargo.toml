@@ -465,3 +465,20 @@ jolt-inlines-bigint = { path = "./jolt-inlines/bigint", default-features = false
 jolt-inlines-secp256k1 = { path = "./jolt-inlines/secp256k1", default-features = false }
 jolt-inlines-grumpkin = { path = "./jolt-inlines/grumpkin", default-features = false }
 jolt-inlines-p256 = { path = "./jolt-inlines/p256", default-features = false }
+
+[patch."https://github.com/markosg04/akita"]
+akita-algebra = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-config = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-error = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-metal = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-pcs = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-prover = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-planner = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-schedules = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-challenges = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-transcript = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-types = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-serialization = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-setup = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-sumcheck = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
+akita-verifier = { git = "https://github.com/0xAndoroid/akita", rev = "aeabc7d9a075881d0256dbdfc18d00823b9c9fe0" }
