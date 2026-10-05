@@ -1028,11 +1028,13 @@ impl ProveRounds<AkitaField> for MetalInstructionReadRafKernel {
         self.cpu.num_rounds()
     }
 
-    /// The bound cycle message and the handoff run beside RegistersVal's
-    /// native and first dense transitions; the device passes touch disjoint
-    /// buffers.
+    /// The bound cycle message, the handoff and the device-resident product5
+    /// rounds run beside RegistersVal's native and dense transitions; the
+    /// device passes touch disjoint buffers.
     fn execution_domain(&self) -> RoundExecutionDomain {
-        if self.address_sequence.is_some() && !self.cpu.metal_address_active() {
+        if self.sequence.is_some()
+            || (self.address_sequence.is_some() && !self.cpu.metal_address_active())
+        {
             RoundExecutionDomain::Accelerator
         } else {
             RoundExecutionDomain::Host
