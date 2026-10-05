@@ -1,10 +1,7 @@
 use std::{mem::size_of, slice};
 
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
-use metal::{
-    objc::rc::autoreleasepool, Buffer, ComputePipelineState, MTLPurgeableState, MTLResourceOptions,
-    MTLSize,
-};
+use metal::{objc::rc::autoreleasepool, Buffer, ComputePipelineState, MTLResourceOptions, MTLSize};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -113,7 +110,6 @@ pub struct Product5Sequence {
     buffers: Product5SequenceBuffers,
     message_threads_per_threadgroup: usize,
     transition_threads_per_threadgroup: usize,
-    initial_elements: usize,
     current_elements: usize,
     e_in_capacity: usize,
     e_out_capacity: usize,
@@ -325,7 +321,6 @@ impl SolinasMetal {
             },
             message_threads_per_threadgroup,
             transition_threads_per_threadgroup,
-            initial_elements: elements_per_table,
             current_elements: elements_per_table,
             e_in_capacity,
             e_out_capacity,
@@ -544,28 +539,9 @@ impl Product5Sequence {
             if mode == Product5Mode::FusedTransition {
                 self.current_elements /= 2;
                 self.source_in_a = !self.source_in_a;
-                self.release_initial_tables()?;
             }
             Ok(message)
         })
-    }
-
-    /// Only the first bind reads the initial tables. Replacing them with the
-    /// next level's quarter-size destination frees their storage for the rest
-    /// of the tail; the first bind itself still holds both tables.
-    fn release_initial_tables(&mut self) -> Result<(), MetalError> {
-        if 2 * self.current_elements == self.initial_elements
-            && self.current_elements >= Product5Mode::FusedTransition.minimum_elements()
-        {
-            let _ = self
-                .buffers
-                .tables_a
-                .set_purgeable_state(MTLPurgeableState::Empty);
-            self.buffers.tables_a = self
-                .context
-                .new_product5_buffer(PRODUCT5_FACTORS * self.current_elements / 2)?;
-        }
-        Ok(())
     }
 
     fn source_buffer(&self) -> &Buffer {
