@@ -294,9 +294,9 @@ pub struct AddressPhaseSequence {
     cycle_bind_threads_per_threadgroup: usize,
     cycle_e_in_capacity: usize,
     cycle_e_out_capacity: usize,
-    /// The handoff's quarter-length product5 tables, allocated by the bound
-    /// cycle message so their residency is warmed before the double bind
-    /// first writes them.
+    /// The handoff's quarter-length product5 tables, allocated by the first
+    /// cycle message once the address weights retire, so their residency is
+    /// warmed two rounds before the double bind first writes them.
     handoff_tables: Option<(Buffer, ResidencyPrefetch)>,
     phases_executed: usize,
 }
@@ -1080,6 +1080,9 @@ impl AddressPhaseSequence {
         e_out: &[AkitaField],
     ) -> Result<[AkitaField; PRODUCT5_FACTORS], MetalError> {
         self.retire_address_weights();
+        let tables = self.context.new_product5_initial_tables(self.rows / 4)?;
+        let warmed = residency::prefetch(vec![tables.clone()]);
+        self.handoff_tables = Some((tables, warmed));
         self.execute_cycle(
             phase_tables,
             table_values,
@@ -1108,9 +1111,6 @@ impl AddressPhaseSequence {
         e_out: &[AkitaField],
     ) -> Result<[AkitaField; PRODUCT5_FACTORS], MetalError> {
         self.retire_address_weights();
-        let tables = self.context.new_product5_initial_tables(self.rows / 4)?;
-        let warmed = residency::prefetch(vec![tables.clone()]);
-        self.handoff_tables = Some((tables, warmed));
         self.execute_cycle(
             phase_tables,
             table_values,
@@ -1143,7 +1143,7 @@ impl AddressPhaseSequence {
         let elements = self.rows / 4;
         let (tables, _warmed) = self.handoff_tables.take().ok_or_else(|| {
             MetalError::InvalidInstructionReadRafGrouped(
-                "resident handoff ran before its bound cycle message".to_owned(),
+                "resident handoff ran before its first cycle message".to_owned(),
             )
         })?;
         let mut sequence = self.context.prepare_product5_sequence_over(
