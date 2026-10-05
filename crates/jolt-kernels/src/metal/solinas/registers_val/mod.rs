@@ -281,6 +281,9 @@ pub struct RegistersValSequence {
     threads_per_threadgroup: usize,
     source_in_a: bool,
     final_in_a: bool,
+    /// Residency of the quarter-size replacement for the native output, warmed
+    /// after the first dense bind so the second does not wire it.
+    tail_residency: Option<ResidencyPrefetch>,
 }
 
 impl SolinasMetal {
@@ -824,6 +827,7 @@ impl RegistersValFirstTransitionInvocation {
             threads_per_threadgroup,
             source_in_a: true,
             final_in_a: self.final_in_a,
+            tail_residency: None,
         })
     }
 
@@ -994,6 +998,7 @@ impl RegistersValSequence {
             self.buffers.dense_a = self
                 .context
                 .new_registers_val_buffer(self.current_elements)?;
+            self.tail_residency = Some(residency::prefetch(vec![self.buffers.dense_a.clone()]));
         }
         Ok(())
     }
