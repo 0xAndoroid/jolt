@@ -62,28 +62,66 @@ impl OneHotTraceRowLayout {
     /// Fills one row's selected-row bytes; returns whether the cycle makes a
     /// remappable RAM access (the only per-row fact the caller still needs —
     /// the bytecode column is total, so no cycle can be missing its slot).
+    /// An inactive access leaves its RAM chunks zero.
     fn fill_row(self, row: OneHotTraceSourceRow, selected_rows: &mut [u8]) -> bool {
-        let (instruction, rest) = selected_rows.split_at_mut(self.instruction);
-        let (increment, rest) = rest.split_at_mut(self.increment);
-        let (bytecode, ram) = rest.split_at_mut(self.bytecode);
-        write_ra_chunks(row.lookup_index.0, self.chunk_bits, instruction);
-        row.fused_inc
-            .write_selected_rows(self.chunk_bits, increment);
-        write_ra_chunks(row.bytecode_pc.0 as u128, self.chunk_bits, bytecode);
-        match row.ram_address.0 {
-            Some(address) => write_ra_chunks(u128::from(address), self.chunk_bits, ram),
-            None => ram.fill(0),
+        if self.chunk_bits == 8 {
+            self.fill_byte_row(row, selected_rows);
+        } else {
+            let (instruction, rest) = selected_rows.split_at_mut(self.instruction);
+            let (increment, rest) = rest.split_at_mut(self.increment);
+            let (bytecode, ram) = rest.split_at_mut(self.bytecode);
+            write_ra_chunks(row.lookup_index.0, self.chunk_bits, instruction);
+            row.fused_inc
+                .write_selected_rows(self.chunk_bits, increment);
+            write_ra_chunks(row.bytecode_pc.0 as u128, self.chunk_bits, bytecode);
+            match row.ram_address.0 {
+                Some(address) => write_ra_chunks(u128::from(address), self.chunk_bits, ram),
+                None => ram.fill(0),
+            }
         }
         row.ram_address.0.is_some()
+    }
+
+    /// The byte-chunk fill `write_ra_chunks` defines, as fixed-width stores:
+    /// each chunk group is the trailing bytes of one 16-byte big-endian store
+    /// ending at the group's end. Groups are stored last first, so a store's
+    /// leading bytes land only in groups that are stored after it.
+    fn fill_byte_row(self, row: OneHotTraceSourceRow, selected_rows: &mut [u8]) {
+        let store = |rows: &mut [u8], end: usize, value: u128| {
+            rows[end - 16..end].copy_from_slice(&value.to_be_bytes());
+        };
+        let increment_start = self.instruction;
+        let bytecode_start = increment_start + self.increment;
+        let ram_start = bytecode_start + self.bytecode;
+        let ram_value = row.ram_address.0.map_or(0, u128::from);
+        store(selected_rows, selected_rows.len(), ram_value);
+        store(selected_rows, ram_start, row.bytecode_pc.0 as u128);
+        row.fused_inc
+            .write_selected_rows(8, &mut selected_rows[increment_start..bytecode_start]);
+        store(selected_rows, increment_start, row.lookup_index.0);
     }
 
     /// A filled row's committed entries: its nonzero selected rows, plus every
     /// RAM chunk of an active access, which commits row zero.
     fn committed_entries(self, selected_rows: &[u8], ram_active: bool) -> usize {
-        let nonzero = |rows: &[u8]| rows.iter().filter(|&&row| row != 0).count();
         let (rows, ram) = selected_rows.split_at(self.instruction + self.increment + self.bytecode);
-        nonzero(rows) + if ram_active { ram.len() } else { nonzero(ram) }
+        nonzero_bytes(rows) + if ram_active { ram.len() } else { 0 }
     }
+}
+
+/// A byte's high bit survives `((b & 0x7f) + 0x7f) | b` iff the byte is
+/// nonzero, so one word counts eight bytes.
+fn nonzero_bytes(bytes: &[u8]) -> usize {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let (words, tail) = bytes.as_chunks::<8>();
+    let nonzero_in_words: u32 = words
+        .iter()
+        .map(|&word| {
+            let x = u64::from_ne_bytes(word);
+            ((((x & LOW7) + LOW7) | x) & !LOW7).count_ones()
+        })
+        .sum();
+    nonzero_in_words as usize + tail.iter().filter(|&&byte| byte != 0).count()
 }
 
 struct PackedTraceRows {

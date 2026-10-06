@@ -122,7 +122,7 @@ impl FusedInc {
         if width == 8 {
             // Adding radix/2 to a byte digit flips its top bit.
             let centered = self.biased_for_balanced_digits(width) as u64 ^ 0x8080_8080_8080_8080;
-            digits.copy_from_slice(&centered.to_le_bytes());
+            digits[..8].copy_from_slice(&centered.to_le_bytes());
         } else {
             for (index, digit) in digits.iter_mut().enumerate() {
                 *digit = self.selected_row(BalancedIncColumn::Digit { width, index }) as u8;
