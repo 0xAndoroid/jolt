@@ -1300,10 +1300,6 @@ impl AddressPhaseSequence {
     }
 
     copy_field_getters! { pub, { phases_executed: usize }}
-
-    pub const fn resident_buffer_count(&self) -> usize {
-        21
-    }
 }
 
 fn validate_resident_grouped_planes(
@@ -1654,7 +1650,7 @@ mod tests {
                 &buckets,
                 AddressPhaseSequenceConfig {
                     rows_per_threadgroup: 1 << 8,
-                    threads_per_threadgroup: Some(32),
+                    threads_per_threadgroup: Some(64),
                 },
                 |row| sources[row],
             )

@@ -367,7 +367,7 @@ inline void address_phase_flush_suffixes(
     }
 }
 
-// One read of each row feeds both the RAF and the suffix sums of its job.
+// One read of each row feeds its job's RAF sums and suffix slots 0-2.
 kernel void solinas_address_phase_tile(
     device const AddressSuffixFullLookup* lookups [[buffer(0)]],
     device SolinasFp128* weights [[buffer(1)]],
