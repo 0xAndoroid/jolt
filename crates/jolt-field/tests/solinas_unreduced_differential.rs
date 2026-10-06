@@ -113,10 +113,6 @@ macro_rules! base_field_suite {
             let f2 = |v: u128| <$F2 as CanonicalEncoding>::from_u128_checked(v).unwrap();
             let val2 = |x: &$F2| x.to_u128_checked().unwrap();
 
-            // Scalar prime fields do not advertise exact delayed sums
-            // (value pinned while the jolt-field baseline coexisted).
-            assert!(!<$F2 as Unreduced>::SUM_IS_EXACT);
-
             // Σ aᵢ·bᵢ: delayed vs per-term vs oracle.
             let check_products = |pairs: &[(u128, u128)]| {
                 let expect = pairs

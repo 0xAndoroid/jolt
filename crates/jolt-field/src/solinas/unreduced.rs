@@ -289,6 +289,10 @@ impl<const P: u128> Unreduced for Fp128<P> {
     type SmallProduct = Fp128MulU64Accum;
     type Wide = Fp128x8i32;
 
+    /// Exact for sums of up to `2^64 − 1` products, the headroom of
+    /// [`reduce_product`](Self::reduce_product)'s carry chain.
+    const SUM_IS_EXACT: bool = true;
+
     #[inline]
     fn mul_unreduced(self, other: Self) -> Fp128ProductAccum {
         let [r0, r1, r2, r3] = self.mul_wide(other);
