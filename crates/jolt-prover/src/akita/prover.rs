@@ -63,9 +63,9 @@ where
     let log_t = config.trace_length.ilog2() as usize;
     // Backend witness preparation only reads the witness and parks owners in
     // the session, which stage 0 never touches, so it runs on its own thread
-    // under the tail of stage 0. It starts once the trace commit returns: its
-    // Stage-1 rows filled under the commit's device set and one-hot selectors
-    // push the stage-0 footprint past physical memory at 2^29.
+    // under the trace commitment. It starts once the commit's dispatch-start
+    // residency peak has subsided (see `prove_stage0`), then waits for the
+    // commit to return and runs the backend's post-commit step.
     let (prepare_signal_sender, prepare_signal_receiver) = std::sync::mpsc::channel::<()>();
     let (stage0, witness_prepare) = std::thread::scope(|scope| {
         let prepare_kernel = backend.base.spartan_outer_uniskip.as_ref();
@@ -86,8 +86,10 @@ where
                 span.in_scope(|| prepare_kernel.prepare_witness(prepare_session, log_t, witness));
             let _ = span.record("complete", result.is_ok());
             result?;
-            tracing::info_span!("jolt_prover::backend_after_trace_commit")
-                .in_scope(|| prepare_kernel.after_trace_commit(prepare_session));
+            if prepare_signal_receiver.recv().is_ok() {
+                tracing::info_span!("jolt_prover::backend_after_trace_commit")
+                    .in_scope(|| prepare_kernel.after_trace_commit(prepare_session));
+            }
             Ok(())
         });
         let stage0 = prove_stage0::<F, PCS, VC, T, W>(

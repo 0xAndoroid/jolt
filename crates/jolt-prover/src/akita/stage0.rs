@@ -1,9 +1,11 @@
 //! Packed stage 0: input validation, commitments, and transcript setup.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use common::jolt_device::JoltDevice;
-use jolt_akita::TraceOneHotCommitment;
+use jolt_akita::{TraceCommitProgress, TraceOneHotCommitment};
 use jolt_claims::protocols::jolt::lattice::{
     OneHotTraceLayoutPlan, OneHotTraceShape, ONE_HOT_TRACE_LAYOUT,
 };
@@ -41,8 +43,10 @@ where
 
 /// Validate inputs, commit the packed objects, and seed the transcript.
 ///
-/// `witness_prepare_signal` receives one message once the trace commit has
-/// returned and released its rows and device residency.
+/// `witness_prepare_signal` receives one message once a quarter of the trace
+/// commit's command buffers have completed (once the commit returns for
+/// backends that report no progress) and another once the commit has returned
+/// and released its rows and device residency.
 #[tracing::instrument(skip_all)]
 pub fn prove_stage0<F, PCS, VC, T, W>(
     backend: &JoltAkitaBackend<F, PCS>,
@@ -240,6 +244,19 @@ where
                 .iter()
                 .map(|(_, _, hint)| *hint)
                 .collect::<Vec<_>>();
+            // Starting after a quarter of the command buffers keeps the
+            // prepare's stage-1 row fill out of the dispatch-start residency
+            // peak while still overlapping most of the dispatch.
+            let prepare_started = Arc::new(AtomicBool::new(false));
+            let progress = witness_prepare_signal.map(|signal| {
+                let signal = signal.clone();
+                let prepare_started = Arc::clone(&prepare_started);
+                Arc::new(move |completed: usize, total: usize| {
+                    if completed * 4 >= total && !prepare_started.swap(true, Ordering::Relaxed) {
+                        let _ = signal.send(());
+                    }
+                }) as Arc<TraceCommitProgress>
+            });
             let committed = PCS::commit_trace_one_hot(
                 &backend.trace_commitment,
                 &preprocessing.pcs_setup,
@@ -247,6 +264,7 @@ where
                 plan.packing().slot_capacity(),
                 packed_trace_rows,
                 &precommitted_hints,
+                progress,
             );
             let (commitment, mut hint) =
                 committed.map_err(|error| VerifierError::FinalOpeningVerificationFailed {
@@ -258,6 +276,9 @@ where
                     reason: error.to_string(),
                 })?;
             if let Some(signal) = witness_prepare_signal {
+                if !prepare_started.swap(true, Ordering::Relaxed) {
+                    let _ = signal.send(());
+                }
                 let _ = signal.send(());
             }
             Ok::<_, ProverError<F>>((commitment, hint))

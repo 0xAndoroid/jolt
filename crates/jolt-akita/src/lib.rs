@@ -47,7 +47,7 @@ pub use native_batching::{
     AkitaNativeBatchPolynomials, AkitaNativeBatchStatement, AkitaNativeBatching,
 };
 pub use schedule_registry::PrecommittedScheduleParams;
-pub use scheme::{AkitaScheme, TraceCommitmentBackend, TraceOneHotCommitment};
+pub use scheme::{AkitaScheme, TraceCommitProgress, TraceCommitmentBackend, TraceOneHotCommitment};
 pub use trace_onehot::{no_selected_row, TraceOneHotRows, TracePackedOneHot, TracePackedSelectors};
 
 /// Jolt↔Akita basis-order bridging, exposed so benchmarks measuring the raw

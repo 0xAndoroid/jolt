@@ -176,6 +176,10 @@ impl RequiredMetalTraceCommitment {
     }
 }
 
+/// Observer of the trace commit's device progress, called with
+/// `(completed, total)` command buffers; only the Metal packed commit reports.
+pub type TraceCommitProgress = dyn Fn(usize, usize) + Send + Sync;
+
 /// Prover seam for committing the packed trace directly from selected one-hot rows.
 pub trait TraceOneHotCommitment: CommitmentScheme {
     fn commit_trace_one_hot(
@@ -185,6 +189,7 @@ pub trait TraceOneHotCommitment: CommitmentScheme {
         column_capacity: usize,
         rows: Arc<dyn TraceOneHotRows>,
         precommitted_hints: &[&Self::OpeningHint],
+        progress: Option<Arc<TraceCommitProgress>>,
     ) -> Result<(Self::Output, Self::OpeningHint), OpeningsError>;
 
     /// Drops the trace rows `hint` retains for the opening.
@@ -386,6 +391,11 @@ impl AkitaScheme {
         column_capacity: usize,
         rows: Arc<dyn TraceOneHotRows>,
         precommitted_hints: &[&AkitaProverHint],
+        #[cfg_attr(
+            not(all(feature = "metal", target_os = "macos")),
+            expect(unused_variables, reason = "only the Metal commit reports progress")
+        )]
+        progress: Option<Arc<TraceCommitProgress>>,
     ) -> Result<(AkitaCommitment, AkitaProverHint), OpeningsError> {
         let profiles = if precommitted_hints.is_empty() {
             None
@@ -409,7 +419,13 @@ impl AkitaScheme {
                     num_vars,
                 ) =>
             {
-                Self::commit_trace_one_hot_metal(setup, &source, profiles.as_ref(), metal)?
+                Self::commit_trace_one_hot_metal(
+                    setup,
+                    &source,
+                    profiles.as_ref(),
+                    metal,
+                    progress,
+                )?
             }
             TraceCommitmentBackendKind::Cpu => {
                 Self::commit_trace_one_hot_cpu(setup, &source, profiles.as_ref())?
@@ -490,6 +506,7 @@ impl AkitaScheme {
         source: &TracePackedOneHot,
         profiles: Option<&PrecommittedGroupProfiles>,
         metal: &RequiredMetalTraceCommitment,
+        progress: Option<Arc<TraceCommitProgress>>,
     ) -> Result<(AkitaBackendCommitment, AkitaBackendHint), OpeningsError> {
         let (backend_prover_setup, _) = setup.one_hot_backend()?;
         let setup_owner = setup
@@ -497,8 +514,12 @@ impl AkitaScheme {
             .as_ref()
             .ok_or_else(|| invalid_batch("Akita setup has no one-hot backend"))?;
         let prepared = metal.prepared_setup(setup_owner)?;
+        let backend = match progress {
+            Some(progress) => metal.backend.with_command_progress(progress),
+            None => metal.backend.clone(),
+        };
         let stack = akita_prover::UniformProverStack::uniform(
-            &metal.backend,
+            &backend,
             prepared.as_ref(),
             backend_prover_setup.expanded.as_ref(),
         )
@@ -757,6 +778,7 @@ impl TraceOneHotCommitment for AkitaScheme {
         column_capacity: usize,
         rows: Arc<dyn TraceOneHotRows>,
         precommitted_hints: &[&Self::OpeningHint],
+        progress: Option<Arc<TraceCommitProgress>>,
     ) -> Result<(Self::Output, Self::OpeningHint), OpeningsError> {
         Self::commit_trace_one_hot(
             backend,
@@ -765,6 +787,7 @@ impl TraceOneHotCommitment for AkitaScheme {
             column_capacity,
             rows,
             precommitted_hints,
+            progress,
         )
     }
 
