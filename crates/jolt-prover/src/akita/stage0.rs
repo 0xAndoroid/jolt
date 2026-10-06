@@ -41,8 +41,8 @@ where
 
 /// Validate inputs, commit the packed objects, and seed the transcript.
 ///
-/// `witness_prepare_signal` receives one message once the one-hot rows are
-/// assembled and another once the trace commit has returned.
+/// `witness_prepare_signal` receives one message once the trace commit has
+/// returned and released its rows and device residency.
 #[tracing::instrument(skip_all)]
 pub fn prove_stage0<F, PCS, VC, T, W>(
     backend: &JoltAkitaBackend<F, PCS>,
@@ -236,9 +236,6 @@ where
                 }
                 rows
             })?;
-            if let Some(signal) = witness_prepare_signal {
-                let _ = signal.send(());
-            }
             let precommitted_hints = precommitted
                 .iter()
                 .map(|(_, _, hint)| *hint)
@@ -255,14 +252,14 @@ where
                 committed.map_err(|error| VerifierError::FinalOpeningVerificationFailed {
                     reason: error.to_string(),
                 })?;
-            if let Some(signal) = witness_prepare_signal {
-                let _ = signal.send(());
-            }
             PCS::release_post_commit_residency(&backend.trace_commitment, &preprocessing.pcs_setup)
                 .and_then(|()| PCS::release_trace_rows(&mut hint))
                 .map_err(|error| VerifierError::FinalOpeningVerificationFailed {
                     reason: error.to_string(),
                 })?;
+            if let Some(signal) = witness_prepare_signal {
+                let _ = signal.send(());
+            }
             Ok::<_, ProverError<F>>((commitment, hint))
         })?;
 
