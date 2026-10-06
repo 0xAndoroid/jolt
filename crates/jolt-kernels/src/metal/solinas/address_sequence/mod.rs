@@ -1,4 +1,4 @@
-use std::{mem::size_of, slice};
+use std::{mem::size_of, ops::Range, slice};
 
 use jolt_field::Prime128OffsetA7F7 as AkitaField;
 use jolt_lookup_tables::{tables::Suffixes, LookupTableKind, XLEN as RISCV_XLEN};
@@ -24,11 +24,13 @@ const RAF_PARTIAL_LANES: usize = 3;
 const RAF_FIELDS: usize = RAF_KEYS * RAF_PARTIAL_LANES;
 const SUFFIX_MAX_SUFFIXES: usize = 5;
 const SUFFIX_FIELDS: usize = SUFFIX_MAX_SUFFIXES * ADDRESS_SUFFIX_BINS;
+// One flag's RAF lanes plus three suffix slots; keep in sync with
+// ADDRESS_PHASE_TILE_FIELDS in address_suffix_full/shader.metal.
+const TILE_FIELDS: usize = (RAF_PARTIAL_LANES + 3) * ADDRESS_SUFFIX_BINS;
 const ACCUMULATOR_WORDS: usize = 5;
 const SIMD_WIDTH: usize = 32;
-const RAF_TILE_PIPELINE: &str = "solinas_address_raf_direct_tile";
+const TILE_PIPELINE: &str = "solinas_address_phase_tile";
 const RAF_FINALIZE_PIPELINE: &str = "solinas_address_raf_direct_finalize";
-const SUFFIX_TILE_PIPELINE: &str = "solinas_address_suffix_full_tile";
 const SUFFIX_FINALIZE_PIPELINE: &str = "solinas_address_suffix_full_finalize";
 const CYCLE_MESSAGE_PIPELINE: &str = "solinas_address_cycle_message";
 const CYCLE_BIND_PIPELINE: &str = "solinas_address_cycle_double_bind";
@@ -127,31 +129,18 @@ impl Default for AddressPhaseSequenceConfig {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct RafParams {
-    rows: u32,
+struct PhaseParams {
     suffix_len: u32,
-    rows_per_threadgroup: u32,
-    threadgroup_count: u32,
     condense: u32,
-    packed_rows: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct SuffixParams {
-    suffix_len: u32,
-    job_count: u32,
-    output_elements: u32,
-    reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SuffixJob {
+struct PhaseJob {
     start: u32,
     end: u32,
     table: u32,
-    reserved: u32,
+    raf_flag: u32,
 }
 
 #[repr(C)]
@@ -243,16 +232,14 @@ struct AddressPhaseBuffers {
     /// begins, since no cycle kernel binds them.
     weights: Option<Buffer>,
     previous_phase_table: Buffer,
+    jobs: Buffer,
     raf_partials: Buffer,
     raf_output: Buffer,
-    raf_params: Buffer,
-    suffix_jobs: Buffer,
     suffix_tables: Buffer,
     suffix_kinds: Buffer,
     suffix_counts: Buffer,
     suffix_partials: Buffer,
     suffix_output: Buffer,
-    suffix_params: Buffer,
     cycle_phase_tables: Buffer,
     cycle_table_values: Buffer,
     cycle_e_in: Buffer,
@@ -266,15 +253,14 @@ struct PreparedAddressPhasePlanes {
     lookups: Buffer,
     cycle_to_table_major: Buffer,
     weights: Buffer,
-    segment_ranges: [std::ops::Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
+    segment_ranges: [Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
     rows: usize,
 }
 
 pub struct AddressPhaseSequence {
     context: SolinasMetal,
-    raf_tile_pipeline: ComputePipelineState,
+    tile_pipeline: ComputePipelineState,
     raf_finalize_pipeline: ComputePipelineState,
-    suffix_tile_pipeline: ComputePipelineState,
     suffix_finalize_pipeline: ComputePipelineState,
     cycle_message_pipeline: ComputePipelineState,
     cycle_bind_pipeline: ComputePipelineState,
@@ -283,11 +269,9 @@ pub struct AddressPhaseSequence {
     cycle_reduce_limits: PipelineLimits,
     buffers: AddressPhaseBuffers,
     rows: usize,
-    raf_threadgroups: usize,
-    suffix_jobs: usize,
+    jobs: usize,
     suffix_slots: usize,
     table_offsets: Vec<usize>,
-    rows_per_threadgroup: usize,
     threads_per_threadgroup: usize,
     suffix_finalize_threads_per_threadgroup: usize,
     cycle_threads_per_threadgroup: usize,
@@ -395,23 +379,14 @@ impl SolinasMetal {
             lookups_buffer,
             cycle_to_table_major_buffer,
             weights_buffer,
-            suffix_jobs,
-            suffix_tables,
+            segment_ranges,
         ) = if let Some(prepared) = prepared {
-            let (suffix_jobs, suffix_tables) = resident_suffix_schedule(
-                rows,
-                &prepared.segment_ranges,
-                config.rows_per_threadgroup,
-                &suffix_counts,
-                &table_offsets,
-            )?;
             (
                 prepared.packed_rows,
                 prepared.lookups,
                 prepared.cycle_to_table_major,
                 prepared.weights,
-                suffix_jobs,
-                suffix_tables,
+                prepared.segment_ranges,
             )
         } else {
             let inverse_bytes = byte_length::<u32>(rows)?;
@@ -433,15 +408,18 @@ impl SolinasMetal {
                     rows,
                 )
             };
+            #[cfg(feature = "parallel")]
+            let raf_flags: Vec<bool> = (0..rows)
+                .into_par_iter()
+                .map(|cycle| source(cycle).0.raf_flag())
+                .collect();
+            #[cfg(not(feature = "parallel"))]
+            let raf_flags: Vec<bool> = (0..rows).map(|cycle| source(cycle).0.raf_flag()).collect();
+            let mut segment_ranges: [Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS] =
+                std::array::from_fn(|_| 0..0);
             let mut table_selected = vec![false; rows];
             let mut table_major_len = 0usize;
-            let mut suffix_jobs = Vec::new();
-            let mut suffix_tables = Vec::with_capacity(ADDRESS_SUFFIX_TABLES);
-            let mut table_row_ranges = Vec::with_capacity(ADDRESS_SUFFIX_TABLES);
             for (table, bucket) in buckets.iter().enumerate() {
-                let job_start = u32::try_from(suffix_jobs.len())
-                    .map_err(|_| MetalError::InputTooLong(suffix_jobs.len()))?;
-                let bucket_start = table_major_len;
                 for &row in bucket {
                     let row = row as usize;
                     if row >= rows {
@@ -455,45 +433,33 @@ impl SolinasMetal {
                     }
                     table_selected[row] = true;
                 }
-                for &row in bucket {
-                    let row = row as usize;
-                    cycle_to_table_major[row] = u32::try_from(table_major_len)
-                        .map_err(|_| MetalError::InputTooLong(table_major_len))?;
-                    table_major_len += 1;
+                for raf_flag in [false, true] {
+                    let start = table_major_len;
+                    for &row in bucket {
+                        let row = row as usize;
+                        if raf_flags[row] == raf_flag {
+                            cycle_to_table_major[row] = u32::try_from(table_major_len)
+                                .map_err(|_| MetalError::InputTooLong(table_major_len))?;
+                            table_major_len += 1;
+                        }
+                    }
+                    segment_ranges[2 * (table + 1) + usize::from(raf_flag)] =
+                        start..table_major_len;
                 }
-                for local_start in (0..bucket.len()).step_by(config.rows_per_threadgroup) {
-                    let local_end = (local_start + config.rows_per_threadgroup).min(bucket.len());
-                    suffix_jobs.push(SuffixJob {
-                        start: u32::try_from(bucket_start + local_start)
-                            .map_err(|_| MetalError::InputTooLong(bucket_start + local_start))?,
-                        end: u32::try_from(bucket_start + local_end)
-                            .map_err(|_| MetalError::InputTooLong(bucket_start + local_end))?,
-                        table: table as u32,
-                        reserved: 0,
-                    });
-                }
-                suffix_tables.push(SuffixTable {
-                    job_start,
-                    job_end: u32::try_from(suffix_jobs.len())
-                        .map_err(|_| MetalError::InputTooLong(suffix_jobs.len()))?,
-                    output_start: u32::try_from(table_offsets[table])
-                        .map_err(|_| MetalError::InputTooLong(table_offsets[table]))?,
-                    suffix_count: u32::from(suffix_counts[table]),
-                });
-                table_row_ranges.push(bucket_start..table_major_len);
             }
-            if suffix_jobs.is_empty() {
-                return Err(MetalError::EmptyAddressSuffixBuckets);
-            }
-            let no_table_start = table_major_len;
-            for (cycle, &selected) in table_selected.iter().enumerate() {
-                if !selected {
-                    cycle_to_table_major[cycle] = u32::try_from(table_major_len)
-                        .map_err(|_| MetalError::InputTooLong(table_major_len))?;
-                    table_major_len += 1;
+            for raf_flag in [false, true] {
+                let start = table_major_len;
+                for (cycle, &selected) in table_selected.iter().enumerate() {
+                    if !selected && raf_flags[cycle] == raf_flag {
+                        cycle_to_table_major[cycle] = u32::try_from(table_major_len)
+                            .map_err(|_| MetalError::InputTooLong(table_major_len))?;
+                        table_major_len += 1;
+                    }
                 }
+                segment_ranges[usize::from(raf_flag)] = start..table_major_len;
             }
             drop(table_selected);
+            drop(raf_flags);
             if table_major_len != rows {
                 return Err(MetalError::AddressPhaseLayoutLength {
                     expected: rows,
@@ -576,31 +542,19 @@ impl SolinasMetal {
                     .position(|&mapped| mapped as usize == table_major)
                     .unwrap_or(rows)
             };
-            for (table, range) in table_row_ranges.iter().enumerate() {
+            for (segment, range) in segment_ranges.iter().enumerate() {
+                let table = (segment / 2).checked_sub(1);
                 if let Some(position) = packed_rows[range.clone()]
                     .iter()
-                    .position(|packed| usize::from(*packed & 0x7f) != table + 1)
+                    .position(|&packed| packed_table(packed) != table)
                 {
                     let table_major = range.start + position;
-                    let packed = packed_rows[table_major];
                     return Err(MetalError::InvalidAddressPhaseBucket {
-                        bucket: table,
+                        bucket: table.unwrap_or(ADDRESS_SUFFIX_TABLES),
                         row: original_cycle(table_major),
-                        actual: packed_table(packed),
+                        actual: packed_table(packed_rows[table_major]),
                     });
                 }
-            }
-            if let Some(position) = packed_rows[no_table_start..]
-                .iter()
-                .position(|packed| packed & 0x7f != 0)
-            {
-                let table_major = no_table_start + position;
-                let packed = packed_rows[table_major];
-                return Err(MetalError::InvalidAddressPhaseBucket {
-                    bucket: ADDRESS_SUFFIX_TABLES,
-                    row: original_cycle(table_major),
-                    actual: packed_table(packed),
-                });
             }
             self.validate_inputs("resident address weights", table_major_weights)?;
             (
@@ -608,14 +562,19 @@ impl SolinasMetal {
                 lookups_buffer,
                 cycle_to_table_major_buffer,
                 weights_buffer,
-                suffix_jobs,
-                suffix_tables,
+                segment_ranges,
             )
         };
+        let (jobs, suffix_tables, suffix_jobs) = phase_schedule(
+            &segment_ranges,
+            config.rows_per_threadgroup,
+            &suffix_counts,
+            &table_offsets,
+        )?;
+        suffix_counts.push(0);
 
-        let raf_tile_pipeline = self.compile_named_pipeline(RAF_TILE_PIPELINE)?;
+        let tile_pipeline = self.compile_named_pipeline(TILE_PIPELINE)?;
         let raf_finalize_pipeline = self.compile_named_pipeline(RAF_FINALIZE_PIPELINE)?;
-        let suffix_tile_pipeline = self.compile_named_pipeline(SUFFIX_TILE_PIPELINE)?;
         let suffix_finalize_pipeline = self.compile_named_pipeline(SUFFIX_FINALIZE_PIPELINE)?;
         let cycle_message_pipeline = self.compile_named_pipeline(CYCLE_MESSAGE_PIPELINE)?;
         let cycle_bind_pipeline = self.compile_named_pipeline(CYCLE_BIND_PIPELINE)?;
@@ -623,9 +582,8 @@ impl SolinasMetal {
             self.compile_named_pipeline(CYCLE_BOUND_MESSAGE_PIPELINE)?;
         let cycle_reduce_pipeline = self.compile_named_pipeline(PRODUCT_REDUCE_PIPELINE)?;
         let limits = [
-            (RAF_TILE_PIPELINE, Self::limits(&raf_tile_pipeline)),
+            (TILE_PIPELINE, Self::limits(&tile_pipeline)),
             (RAF_FINALIZE_PIPELINE, Self::limits(&raf_finalize_pipeline)),
-            (SUFFIX_TILE_PIPELINE, Self::limits(&suffix_tile_pipeline)),
             (
                 SUFFIX_FINALIZE_PIPELINE,
                 Self::limits(&suffix_finalize_pipeline),
@@ -661,7 +619,7 @@ impl SolinasMetal {
                 });
             }
         }
-        let tile_limits = Self::limits(&raf_tile_pipeline);
+        let tile_limits = Self::limits(&tile_pipeline);
         let threads_per_threadgroup =
             Self::resolve_threadgroup_width(config.threads_per_threadgroup, tile_limits)?;
         let cycle_threads_per_threadgroup = Self::resolve_threadgroup_width(
@@ -682,17 +640,13 @@ impl SolinasMetal {
                     .max_total_threads_per_threadgroup,
             });
         }
-        for limits in [
-            Self::limits(&raf_finalize_pipeline),
-            Self::limits(&suffix_tile_pipeline),
-        ] {
-            if threads_per_threadgroup > limits.max_total_threads_per_threadgroup {
-                return Err(MetalError::InvalidThreadgroupWidth {
-                    requested: threads_per_threadgroup,
-                    execution_width: limits.thread_execution_width,
-                    maximum: limits.max_total_threads_per_threadgroup,
-                });
-            }
+        let raf_finalize_limits = Self::limits(&raf_finalize_pipeline);
+        if threads_per_threadgroup > raf_finalize_limits.max_total_threads_per_threadgroup {
+            return Err(MetalError::InvalidThreadgroupWidth {
+                requested: threads_per_threadgroup,
+                execution_width: raf_finalize_limits.thread_execution_width,
+                maximum: raf_finalize_limits.max_total_threads_per_threadgroup,
+            });
         }
         let suffix_finalize_limits = Self::limits(&suffix_finalize_pipeline);
         let suffix_finalize_threads_per_threadgroup = SUFFIX_FIELDS
@@ -706,38 +660,26 @@ impl SolinasMetal {
                 maximum: suffix_finalize_limits.max_total_threads_per_threadgroup,
             });
         }
-        for (requested, suffix) in [
-            (RAF_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>(), false),
-            (SUFFIX_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>(), true),
-        ] {
-            let maximum = self.device.max_threadgroup_memory_length();
-            if requested as u64 > maximum {
-                return Err(if suffix {
-                    MetalError::AddressSuffixThreadgroupMemory {
-                        requested: requested as u64,
-                        maximum,
-                    }
-                } else {
-                    MetalError::AddressRafDirectThreadgroupMemory {
-                        requested: requested as u64,
-                        maximum,
-                    }
-                });
-            }
+        let tile_threadgroup_bytes = (TILE_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>()) as u64;
+        let maximum = self.device.max_threadgroup_memory_length();
+        if tile_threadgroup_bytes > maximum {
+            return Err(MetalError::AddressRafDirectThreadgroupMemory {
+                requested: tile_threadgroup_bytes,
+                maximum,
+            });
         }
 
-        let raf_threadgroups = rows.div_ceil(config.rows_per_threadgroup);
         let suffix_slots = *table_offsets.last().unwrap_or(&0);
         let suffix_output_elements = suffix_slots
             .checked_mul(ADDRESS_SUFFIX_BINS)
             .ok_or(MetalError::InputTooLong(suffix_slots))?;
-        let raf_partial_elements = raf_threadgroups
-            .checked_mul(RAF_FIELDS)
-            .ok_or(MetalError::InputTooLong(raf_threadgroups))?;
-        let suffix_partial_elements = suffix_jobs
+        let raf_partial_elements = jobs
             .len()
+            .checked_mul(RAF_FIELDS)
+            .ok_or(MetalError::InputTooLong(jobs.len()))?;
+        let suffix_partial_elements = suffix_jobs
             .checked_mul(SUFFIX_FIELDS)
-            .ok_or(MetalError::InputTooLong(suffix_jobs.len()))?;
+            .ok_or(MetalError::InputTooLong(suffix_jobs))?;
         let cycle_pairs = (rows / 2).max(1);
         let cycle_e_out_capacity = 1usize << ((rows.ilog2() as usize) / 2);
         let cycle_e_in_capacity = cycle_pairs.div_ceil(cycle_e_out_capacity).max(1);
@@ -752,7 +694,7 @@ impl SolinasMetal {
             byte_length::<Fp128>(ADDRESS_RAF_BINS)?,
             byte_length::<Fp128>(raf_partial_elements)?,
             byte_length::<Fp128>(ADDRESS_RAF_LANES * ADDRESS_RAF_BINS)?,
-            byte_length::<SuffixJob>(suffix_jobs.len())?,
+            byte_length::<PhaseJob>(jobs.len())?,
             byte_length::<SuffixTable>(suffix_tables.len())?,
             byte_length::<u8>(suffix_kinds.len())?,
             byte_length::<u8>(suffix_counts.len())?,
@@ -771,31 +713,12 @@ impl SolinasMetal {
             }
         }
 
-        let raf_params = RafParams {
-            rows: u32::try_from(rows).map_err(|_| MetalError::InputTooLong(rows))?,
-            suffix_len: 120,
-            rows_per_threadgroup: u32::try_from(config.rows_per_threadgroup)
-                .map_err(|_| MetalError::InputTooLong(config.rows_per_threadgroup))?,
-            threadgroup_count: u32::try_from(raf_threadgroups)
-                .map_err(|_| MetalError::InputTooLong(raf_threadgroups))?,
-            condense: 0,
-            packed_rows: 1,
-        };
-        let suffix_params = SuffixParams {
-            suffix_len: 120,
-            job_count: u32::try_from(suffix_jobs.len())
-                .map_err(|_| MetalError::InputTooLong(suffix_jobs.len()))?,
-            output_elements: u32::try_from(suffix_output_elements)
-                .map_err(|_| MetalError::InputTooLong(suffix_output_elements))?,
-            reserved: 0,
-        };
         let identity = [Fp128::ONE; ADDRESS_RAF_BINS];
 
         Ok(AddressPhaseSequence {
             context: self.clone(),
-            raf_tile_pipeline,
+            tile_pipeline,
             raf_finalize_pipeline,
-            suffix_tile_pipeline,
             suffix_finalize_pipeline,
             cycle_message_pipeline,
             cycle_bind_pipeline,
@@ -808,6 +731,7 @@ impl SolinasMetal {
                 cycle_to_table_major: cycle_to_table_major_buffer,
                 weights: Some(weights_buffer),
                 previous_phase_table: buffer_from_slice(&self.device, &identity),
+                jobs: buffer_from_slice(&self.device, &jobs),
                 raf_partials: self.device.new_buffer(
                     byte_length::<Fp128>(raf_partial_elements)?,
                     MTLResourceOptions::StorageModeShared,
@@ -816,8 +740,6 @@ impl SolinasMetal {
                     byte_length::<Fp128>(ADDRESS_RAF_LANES * ADDRESS_RAF_BINS)?,
                     MTLResourceOptions::StorageModeShared,
                 ),
-                raf_params: buffer_from_slice(&self.device, slice::from_ref(&raf_params)),
-                suffix_jobs: buffer_from_slice(&self.device, &suffix_jobs),
                 suffix_tables: buffer_from_slice(&self.device, &suffix_tables),
                 suffix_kinds: buffer_from_slice(&self.device, &suffix_kinds),
                 suffix_counts: buffer_from_slice(&self.device, &suffix_counts),
@@ -829,7 +751,6 @@ impl SolinasMetal {
                     byte_length::<Fp128>(suffix_output_elements)?,
                     MTLResourceOptions::StorageModeShared,
                 ),
-                suffix_params: buffer_from_slice(&self.device, slice::from_ref(&suffix_params)),
                 cycle_phase_tables: self.device.new_buffer(
                     byte_length::<Fp128>(CYCLE_PHASE_ELEMENTS)?,
                     MTLResourceOptions::StorageModeShared,
@@ -856,11 +777,9 @@ impl SolinasMetal {
                 ),
             },
             rows,
-            raf_threadgroups,
-            suffix_jobs: suffix_jobs.len(),
+            jobs: jobs.len(),
             suffix_slots,
             table_offsets,
-            rows_per_threadgroup: config.rows_per_threadgroup,
             threads_per_threadgroup,
             suffix_finalize_threads_per_threadgroup,
             cycle_threads_per_threadgroup,
@@ -906,44 +825,32 @@ impl AddressPhaseSequence {
                 .validate_inputs("resident address condensation table", table)?;
             write_buffer(&self.buffers.previous_phase_table, table);
         }
-        write_value(
-            &self.buffers.raf_params,
-            RafParams {
-                rows: self.rows as u32,
-                suffix_len,
-                rows_per_threadgroup: self.rows_per_threadgroup as u32,
-                threadgroup_count: self.raf_threadgroups as u32,
-                condense: u32::from(previous_phase_table.is_some()),
-                packed_rows: 1,
-            },
-        );
-        write_value(
-            &self.buffers.suffix_params,
-            SuffixParams {
-                suffix_len,
-                job_count: self.suffix_jobs as u32,
-                output_elements: (self.suffix_slots * ADDRESS_SUFFIX_BINS) as u32,
-                reserved: 0,
-            },
-        );
+        let params = PhaseParams {
+            suffix_len,
+            condense: u32::from(previous_phase_table.is_some()),
+        };
+        let job_count = self.jobs as u32;
 
         let command_buffer = self.context.queue.new_command_buffer();
         autoreleasepool(|| {
-            let raf_tile = command_buffer.new_compute_command_encoder();
-            raf_tile.set_compute_pipeline_state(&self.raf_tile_pipeline);
-            raf_tile.set_buffer(0, Some(&self.buffers.packed_rows), 0);
-            raf_tile.set_buffer(1, Some(&self.buffers.lookups), 0);
-            raf_tile.set_buffer(2, Some(weights), 0);
-            raf_tile.set_buffer(3, Some(&self.buffers.previous_phase_table), 0);
-            raf_tile.set_buffer(4, Some(&self.buffers.raf_partials), 0);
-            raf_tile.set_buffer(5, Some(&self.buffers.raf_params), 0);
-            raf_tile.set_threadgroup_memory_length(
+            let tile = command_buffer.new_compute_command_encoder();
+            tile.set_compute_pipeline_state(&self.tile_pipeline);
+            tile.set_buffer(0, Some(&self.buffers.lookups), 0);
+            tile.set_buffer(1, Some(weights), 0);
+            tile.set_buffer(2, Some(&self.buffers.previous_phase_table), 0);
+            tile.set_buffer(3, Some(&self.buffers.jobs), 0);
+            tile.set_buffer(4, Some(&self.buffers.suffix_kinds), 0);
+            tile.set_buffer(5, Some(&self.buffers.suffix_counts), 0);
+            tile.set_buffer(6, Some(&self.buffers.raf_partials), 0);
+            tile.set_buffer(7, Some(&self.buffers.suffix_partials), 0);
+            set_inline_bytes(tile, 8, &params);
+            tile.set_threadgroup_memory_length(
                 0,
-                (RAF_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>()) as u64,
+                (TILE_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>()) as u64,
             );
-            raf_tile.dispatch_thread_groups(
+            tile.dispatch_thread_groups(
                 MTLSize {
-                    width: self.raf_threadgroups as u64,
+                    width: self.jobs as u64,
                     height: 1,
                     depth: 1,
                 },
@@ -953,13 +860,13 @@ impl AddressPhaseSequence {
                     depth: 1,
                 },
             );
-            raf_tile.end_encoding();
+            tile.end_encoding();
 
             let raf_finalize = command_buffer.new_compute_command_encoder();
             raf_finalize.set_compute_pipeline_state(&self.raf_finalize_pipeline);
             raf_finalize.set_buffer(0, Some(&self.buffers.raf_partials), 0);
             raf_finalize.set_buffer(1, Some(&self.buffers.raf_output), 0);
-            raf_finalize.set_buffer(2, Some(&self.buffers.raf_params), 0);
+            set_inline_bytes(raf_finalize, 2, &job_count);
             let simdgroups = self.threads_per_threadgroup / SIMD_WIDTH;
             raf_finalize.set_threadgroup_memory_length(
                 0,
@@ -978,33 +885,6 @@ impl AddressPhaseSequence {
                 },
             );
             raf_finalize.end_encoding();
-
-            let suffix_tile = command_buffer.new_compute_command_encoder();
-            suffix_tile.set_compute_pipeline_state(&self.suffix_tile_pipeline);
-            suffix_tile.set_buffer(0, Some(&self.buffers.lookups), 0);
-            suffix_tile.set_buffer(1, Some(weights), 0);
-            suffix_tile.set_buffer(2, Some(&self.buffers.suffix_jobs), 0);
-            suffix_tile.set_buffer(3, Some(&self.buffers.suffix_kinds), 0);
-            suffix_tile.set_buffer(4, Some(&self.buffers.suffix_counts), 0);
-            suffix_tile.set_buffer(5, Some(&self.buffers.suffix_partials), 0);
-            suffix_tile.set_buffer(6, Some(&self.buffers.suffix_params), 0);
-            suffix_tile.set_threadgroup_memory_length(
-                0,
-                (SUFFIX_FIELDS * ACCUMULATOR_WORDS * size_of::<u32>()) as u64,
-            );
-            suffix_tile.dispatch_thread_groups(
-                MTLSize {
-                    width: self.suffix_jobs as u64,
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: self.threads_per_threadgroup as u64,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-            suffix_tile.end_encoding();
 
             let suffix_finalize = command_buffer.new_compute_command_encoder();
             suffix_finalize.set_compute_pipeline_state(&self.suffix_finalize_pipeline);
@@ -1527,7 +1407,7 @@ fn validate_resident_grouped_planes(
 
 fn validate_resident_segment_ranges(
     rows: usize,
-    ranges: &[std::ops::Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
+    ranges: &[Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
 ) -> Result<(), MetalError> {
     let mut cursor = 0usize;
     for physical in 0..INSTRUCTION_READ_RAF_SEGMENTS {
@@ -1552,51 +1432,51 @@ fn validate_resident_segment_ranges(
     Ok(())
 }
 
-fn resident_suffix_schedule(
-    rows: usize,
-    ranges: &[std::ops::Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
+/// Tile jobs of at most `rows_per_threadgroup` rows per (table, RAF flag)
+/// segment, every table's jobs before those of rows without a table, so the
+/// suffix partials cover exactly the first `table jobs` jobs. Returns the jobs,
+/// each table's job range for the suffix finalize, and the table job count.
+fn phase_schedule(
+    ranges: &[Range<usize>; INSTRUCTION_READ_RAF_SEGMENTS],
     rows_per_threadgroup: usize,
     suffix_counts: &[u8],
     table_offsets: &[usize],
-) -> Result<(Vec<SuffixJob>, Vec<SuffixTable>), MetalError> {
+) -> Result<(Vec<PhaseJob>, Vec<SuffixTable>, usize), MetalError> {
+    let narrow = |value: usize| u32::try_from(value).map_err(|_| MetalError::InputTooLong(value));
+    // Logical segment `2 * (table + 1) + raf_flag`; rows without a table at
+    // `raf_flag` (see validate_resident_segment_ranges).
+    let push_segment = |jobs: &mut Vec<PhaseJob>, table: usize, segment: usize| {
+        let range = &ranges[segment];
+        for start in range.clone().step_by(rows_per_threadgroup) {
+            jobs.push(PhaseJob {
+                start: narrow(start)?,
+                end: narrow((start + rows_per_threadgroup).min(range.end))?,
+                table: narrow(table)?,
+                raf_flag: (segment % 2) as u32,
+            });
+        }
+        Ok::<_, MetalError>(())
+    };
     let mut jobs = Vec::new();
     let mut tables = Vec::with_capacity(ADDRESS_SUFFIX_TABLES);
     for table in 0..ADDRESS_SUFFIX_TABLES {
-        let false_range = &ranges[2 * (table + 1)];
-        let true_range = &ranges[2 * (table + 1) + 1];
-        if false_range.end != true_range.start {
-            return Err(resident_grouped_error(
-                "resident grouped table flag ranges are not adjacent",
-            ));
-        }
-        let job_start =
-            u32::try_from(jobs.len()).map_err(|_| MetalError::InputTooLong(jobs.len()))?;
-        for start in (false_range.start..true_range.end).step_by(rows_per_threadgroup) {
-            let end = (start + rows_per_threadgroup).min(true_range.end);
-            jobs.push(SuffixJob {
-                start: u32::try_from(start).map_err(|_| MetalError::InputTooLong(start))?,
-                end: u32::try_from(end).map_err(|_| MetalError::InputTooLong(end))?,
-                table: table as u32,
-                reserved: 0,
-            });
-        }
+        let job_start = narrow(jobs.len())?;
+        push_segment(&mut jobs, table, 2 * (table + 1))?;
+        push_segment(&mut jobs, table, 2 * (table + 1) + 1)?;
         tables.push(SuffixTable {
             job_start,
-            job_end: u32::try_from(jobs.len()).map_err(|_| MetalError::InputTooLong(jobs.len()))?,
-            output_start: u32::try_from(table_offsets[table])
-                .map_err(|_| MetalError::InputTooLong(table_offsets[table]))?,
+            job_end: narrow(jobs.len())?,
+            output_start: narrow(table_offsets[table])?,
             suffix_count: u32::from(suffix_counts[table]),
         });
     }
-    if jobs.is_empty() {
+    let table_jobs = jobs.len();
+    if table_jobs == 0 {
         return Err(MetalError::EmptyAddressSuffixBuckets);
     }
-    if ranges.iter().any(|range| range.end > rows) {
-        return Err(resident_grouped_error(
-            "resident grouped suffix schedule exceeds the row domain",
-        ));
-    }
-    Ok((jobs, tables))
+    push_segment(&mut jobs, ADDRESS_SUFFIX_TABLES, 0)?;
+    push_segment(&mut jobs, ADDRESS_SUFFIX_TABLES, 1)?;
+    Ok((jobs, tables, table_jobs))
 }
 
 fn resident_grouped_error(message: &'static str) -> MetalError {
@@ -1617,8 +1497,7 @@ fn packed_source(row_and_weight: (AddressRafScanRow, Fp128)) -> (AddressLookup, 
 }
 
 fn packed_table(packed: u8) -> Option<usize> {
-    let table = usize::from(packed & 0x7f);
-    (table != 0).then_some(table - 1)
+    usize::from(packed & 0x7f).checked_sub(1)
 }
 
 fn write_phase_tables(buffer: &Buffer, tables: &[Vec<AkitaField>]) {
@@ -1649,10 +1528,6 @@ fn write_buffer<T: Copy>(buffer: &Buffer, values: &[T]) {
     output.copy_from_slice(values);
 }
 
-fn write_value<T: Copy>(buffer: &Buffer, value: T) {
-    write_buffer(buffer, slice::from_ref(&value));
-}
-
 fn byte_length<T>(elements: usize) -> Result<u64, MetalError> {
     elements
         .checked_mul(size_of::<T>())
@@ -1660,9 +1535,8 @@ fn byte_length<T>(elements: usize) -> Result<u64, MetalError> {
         .ok_or(MetalError::InputTooLong(elements))
 }
 
-const _: () = assert!(size_of::<RafParams>() == 24);
-const _: () = assert!(size_of::<SuffixParams>() == 16);
-const _: () = assert!(size_of::<SuffixJob>() == 16);
+const _: () = assert!(size_of::<PhaseParams>() == 8);
+const _: () = assert!(size_of::<PhaseJob>() == 16);
 const _: () = assert!(size_of::<SuffixTable>() == 16);
 const _: () = assert!(size_of::<AddressLookup>() == 16);
 const _: () = assert!(size_of::<CycleParams>() == 16);
@@ -1723,8 +1597,9 @@ mod tests {
     #[test]
     fn address_phases_match_field_oracle() {
         let tables: Vec<_> = LookupTableKind::<RISCV_XLEN>::iter().collect();
-        // Per table, 64-row blocks of one chunk distribution: every chunk zero,
-        // every chunk nonzero, both alternating, and two shared values.
+        // Per table, 128-row blocks of one chunk distribution: every chunk zero,
+        // every chunk nonzero, both alternating, and two shared values. Rows
+        // without a table repeat the distributions.
         let lookup = |pattern: usize, row: usize| {
             let nonzero = (0..16).fold(0u128, |bits, byte| {
                 bits | (((1 + (row * 37 + byte * 11) % 255) as u128) << (8 * byte))
@@ -1738,7 +1613,7 @@ mod tests {
                 _ => 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
             }
         };
-        let rows = (tables.len() * 5 * 64 + 1).next_power_of_two();
+        let rows = (tables.len() * 5 * 128 + 1).next_power_of_two();
         let mut buckets = vec![Vec::new(); tables.len()];
         let mut lookups = vec![0u128; rows];
         let mut flags = vec![false; rows];
@@ -1746,7 +1621,7 @@ mod tests {
         let mut row = 0;
         for table in &tables {
             for pattern in 0..5 {
-                for _ in 0..64 {
+                for _ in 0..128 {
                     buckets[table.index()].push(row as u32);
                     lookups[row] = lookup(pattern, row);
                     flags[row] = (row / 3) % 2 == 1;
@@ -1754,6 +1629,10 @@ mod tests {
                     row += 1;
                 }
             }
+        }
+        for no_table_row in row..rows {
+            lookups[no_table_row] = lookup((no_table_row / 128) % 5, no_table_row);
+            flags[no_table_row] = (no_table_row / 3) % 2 == 1;
         }
         let near_modulus = u128::MAX - 0xffff_a7f7;
         let mut weights: Vec<_> = (0..rows)
@@ -1774,8 +1653,8 @@ mod tests {
                 rows,
                 &buckets,
                 AddressPhaseSequenceConfig {
-                    rows_per_threadgroup: 1 << 10,
-                    threads_per_threadgroup: Some(64),
+                    rows_per_threadgroup: 1 << 8,
+                    threads_per_threadgroup: Some(32),
                 },
                 |row| sources[row],
             )

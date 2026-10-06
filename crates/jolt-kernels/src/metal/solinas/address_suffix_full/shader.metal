@@ -1,20 +1,27 @@
 #define ADDRESS_SUFFIX_FULL_BINS 256u
 #define ADDRESS_SUFFIX_FULL_MAX_SUFFIXES 5u
-#define ADDRESS_SUFFIX_FULL_WORDS 5u
 #define ADDRESS_SUFFIX_FULL_FIELDS (ADDRESS_SUFFIX_FULL_BINS * ADDRESS_SUFFIX_FULL_MAX_SUFFIXES)
+// One tile pass accumulates a job's three RAF lanes (one flag) and three
+// suffix slots: 1536 deferred sums = 30 KiB of threadgroup memory. Keep in
+// sync with TILE_FIELDS in address_sequence/mod.rs.
+#define ADDRESS_PHASE_RAF_FIELDS (ADDRESS_RAF_DIRECT_LANES * ADDRESS_RAF_DIRECT_BINS)
+#define ADDRESS_PHASE_SUFFIX_SLOTS 3u
+#define ADDRESS_PHASE_HIGH_SLOTS (ADDRESS_SUFFIX_FULL_MAX_SUFFIXES - ADDRESS_PHASE_SUFFIX_SLOTS)
+#define ADDRESS_PHASE_TILE_FIELDS \
+    (ADDRESS_PHASE_RAF_FIELDS + ADDRESS_PHASE_SUFFIX_SLOTS * ADDRESS_SUFFIX_FULL_BINS)
 
-struct AddressSuffixFullParams {
+struct AddressPhaseParams {
     uint suffix_len;
-    uint job_count;
-    uint output_elements;
-    uint reserved;
+    uint condense;
 };
 
-struct AddressSuffixFullJob {
+// Rows [start, end) share one RAF flag and one table; rows without a table
+// use index `table count`, whose suffix count is zero.
+struct AddressPhaseJob {
     uint start;
     uint end;
     uint table;
-    uint reserved;
+    uint raf_flag;
 };
 
 struct AddressSuffixFullTable {
@@ -305,117 +312,202 @@ inline ulong address_suffix_full_evaluate(uchar kind, AddressSuffixFullBits bits
     }
 }
 
-inline SolinasFp128 address_suffix_full_field_from_u64(ulong scalar) {
-    SolinasFp128 value = solinas_zero();
-    value.limb[0] = (uint)scalar;
-    value.limb[1] = (uint)(scalar >> 32);
+inline SolinasFp128 address_suffix_full_field_from_u128(ulong lo, ulong hi) {
+    SolinasFp128 value;
+    value.limb = uint4((uint)lo, (uint)(lo >> 32), (uint)hi, (uint)(hi >> 32));
     return value;
 }
 
-inline void address_suffix_full_atomic_add(
+// Suffix slots [FIRST, FIRST + SLOTS) of one row. The fixed bounds allow
+// unrolling.
+template <uint FIRST, uint SLOTS>
+inline void address_phase_add_suffixes(
     threadgroup atomic_uint* sums,
-    uint field,
-    SolinasFp128 value)
+    thread SolinasLazySum (&chunk_zero)[SLOTS],
+    device const uchar* kinds,
+    uint suffix_count,
+    uint first_field,
+    AddressSuffixFullBits bits,
+    uint chunk,
+    SolinasFp128 weight)
 {
-    uint base = field * ADDRESS_SUFFIX_FULL_WORDS;
-    uint carry = 0;
-    for (uint limb = 0; limb < 4; limb++) {
-        ulong addend = (ulong)value.limb[limb] + (ulong)carry;
-        uint low = (uint)addend;
-        uint previous = atomic_fetch_add_explicit(
-            &sums[base + limb],
-            low,
-            memory_order_relaxed);
-        carry = (uint)(addend >> 32) | (uint)(previous > 0xffffffffu - low);
-    }
-    if (carry != 0) {
-        atomic_fetch_add_explicit(&sums[base + 4], carry, memory_order_relaxed);
+    for (uint slot = 0; slot < SLOTS; slot++) {
+        if (FIRST + slot >= suffix_count) {
+            break;
+        }
+        ulong scalar = address_suffix_full_evaluate(kinds[FIRST + slot], bits);
+        if (scalar == 0) {
+            continue;
+        }
+        SolinasFp128 contribution = scalar == 1
+            ? weight
+            : solinas_mul_wide(weight, address_suffix_full_field_from_u128(scalar, 0));
+        if (chunk == 0) {
+            solinas_lazy_add(chunk_zero[slot], contribution);
+        } else {
+            solinas_deferred_atomic_add_5(
+                sums, first_field + slot * ADDRESS_SUFFIX_FULL_BINS + chunk, contribution);
+        }
     }
 }
 
-inline SolinasFp128 address_suffix_full_reduce_atomic_sum(
+template <uint FIRST, uint SLOTS>
+inline void address_phase_flush_suffixes(
     threadgroup atomic_uint* sums,
-    uint field)
+    thread SolinasLazySum (&chunk_zero)[SLOTS],
+    uint suffix_count,
+    uint first_field,
+    uint lane)
 {
-    uint base = field * ADDRESS_SUFFIX_FULL_WORDS;
-    SolinasFp128 low;
-    for (uint limb = 0; limb < 4; limb++) {
-        low.limb[limb] = atomic_load_explicit(&sums[base + limb], memory_order_relaxed);
+    for (uint slot = 0; slot < SLOTS; slot++) {
+        if (FIRST + slot < suffix_count) {
+            solinas_deferred_atomic_flush_simd(
+                sums, first_field + slot * ADDRESS_SUFFIX_FULL_BINS, chunk_zero[slot], lane);
+        }
     }
-    uint overflow = atomic_load_explicit(&sums[base + 4], memory_order_relaxed);
-    SolinasCorrection canonical = solinas_add_offset(low);
-    low = solinas_select(canonical.carry != 0, canonical.value, low);
-
-    ulong correction_word = (ulong)overflow * (ulong)SOLINAS_OFFSET;
-    SolinasFp128 correction = solinas_zero();
-    correction.limb[0] = (uint)correction_word;
-    correction.limb[1] = (uint)(correction_word >> 32);
-    return solinas_add(low, correction);
 }
 
-kernel void solinas_address_suffix_full_tile(
+// One read of each row feeds both the RAF and the suffix sums of its job.
+kernel void solinas_address_phase_tile(
     device const AddressSuffixFullLookup* lookups [[buffer(0)]],
-    device const SolinasFp128* weights [[buffer(1)]],
-    device const AddressSuffixFullJob* jobs [[buffer(2)]],
-    device const uchar* suffix_kinds [[buffer(3)]],
-    device const uchar* suffix_counts [[buffer(4)]],
-    device SolinasFp128* partials [[buffer(5)]],
-    constant AddressSuffixFullParams& params [[buffer(6)]],
+    device SolinasFp128* weights [[buffer(1)]],
+    device const SolinasFp128* previous_phase_table [[buffer(2)]],
+    device const AddressPhaseJob* jobs [[buffer(3)]],
+    device const uchar* suffix_kinds [[buffer(4)]],
+    device const uchar* suffix_counts [[buffer(5)]],
+    device SolinasFp128* raf_partials [[buffer(6)]],
+    device SolinasFp128* suffix_partials [[buffer(7)]],
+    constant AddressPhaseParams& params [[buffer(8)]],
     threadgroup atomic_uint* sums [[threadgroup(0)]],
     uint job_index [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint threads [[threads_per_threadgroup]])
 {
-    for (uint counter = tid; counter < ADDRESS_SUFFIX_FULL_FIELDS * ADDRESS_SUFFIX_FULL_WORDS; counter += threads) {
+    for (uint counter = tid; counter < ADDRESS_PHASE_TILE_FIELDS * SOLINAS_DEFERRED_SUM_WORDS;
+         counter += threads) {
         atomic_store_explicit(&sums[counter], 0u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    AddressSuffixFullJob job = jobs[job_index];
+    AddressPhaseJob job = jobs[job_index];
     uint suffix_count = suffix_counts[job.table];
-    SolinasLazySum chunk_zero[ADDRESS_SUFFIX_FULL_MAX_SUFFIXES];
-    for (uint suffix = 0; suffix < ADDRESS_SUFFIX_FULL_MAX_SUFFIXES; suffix++) {
-        chunk_zero[suffix] = solinas_lazy_zero();
+    device const uchar* kinds = suffix_kinds + job.table * ADDRESS_SUFFIX_FULL_MAX_SUFFIXES;
+    uint upper_bits = params.suffix_len > 64 ? params.suffix_len - 64 : 0;
+    // Chunk 0 dominates (padding rows, the high chunks of 64-bit lookups);
+    // its fields are summed per thread instead of contended atomics.
+    SolinasLazySum raf_zero[ADDRESS_RAF_DIRECT_LANES];
+    for (uint output_lane = 0; output_lane < ADDRESS_RAF_DIRECT_LANES; output_lane++) {
+        raf_zero[output_lane] = solinas_lazy_zero();
+    }
+    SolinasLazySum suffix_zero[ADDRESS_PHASE_SUFFIX_SLOTS];
+    for (uint slot = 0; slot < ADDRESS_PHASE_SUFFIX_SLOTS; slot++) {
+        suffix_zero[slot] = solinas_lazy_zero();
     }
     for (uint row = job.start + tid; row < job.end; row += threads) {
         AddressSuffixFullLookup lookup = lookups[row];
+        SolinasFp128 weight = weights[row];
+        if (params.condense != 0) {
+            uint previous_chunk = address_suffix_full_lookup_byte(lookup, params.suffix_len + 8);
+            weight = solinas_mul_wide(weight, previous_phase_table[previous_chunk]);
+            weights[row] = weight;
+        }
         AddressSuffixFullBits bits = address_suffix_full_bits(lookup, params.suffix_len);
         uint chunk = address_suffix_full_lookup_byte(lookup, params.suffix_len);
-        SolinasFp128 weight = weights[row];
-        // The fixed bound allows unrolling.
-        for (uint suffix = 0; suffix < ADDRESS_SUFFIX_FULL_MAX_SUFFIXES; suffix++) {
-            if (suffix >= suffix_count) {
-                break;
+
+        SolinasFp128 raf[ADDRESS_RAF_DIRECT_LANES];
+        bool present[ADDRESS_RAF_DIRECT_LANES];
+        raf[0] = weight;
+        present[0] = true;
+        if (job.raf_flag == 0) {
+            present[1] = bits.x != 0;
+            present[2] = bits.y != 0;
+            raf[1] = present[1]
+                ? solinas_mul_wide(weight, address_suffix_full_field_from_u128(bits.x, 0))
+                : solinas_zero();
+            raf[2] = present[2]
+                ? solinas_mul_wide(weight, address_suffix_full_field_from_u128(bits.y, 0))
+                : solinas_zero();
+        } else {
+            present[1] = bits.lo != 0 || bits.hi != 0;
+            present[2] = upper_bits == 0 || bits.hi == address_suffix_full_mask(upper_bits);
+            raf[1] = present[1]
+                ? solinas_mul_wide(weight, address_suffix_full_field_from_u128(bits.lo, bits.hi))
+                : solinas_zero();
+            raf[2] = weight;
+        }
+        for (uint output_lane = 0; output_lane < ADDRESS_RAF_DIRECT_LANES; output_lane++) {
+            if (!present[output_lane]) {
+                continue;
             }
-            uchar kind = suffix_kinds[job.table * ADDRESS_SUFFIX_FULL_MAX_SUFFIXES + suffix];
-            ulong scalar = address_suffix_full_evaluate(kind, bits);
-            if (scalar != 0) {
-                SolinasFp128 contribution = scalar == 1
-                    ? weight
-                    : solinas_mul_wide(weight, address_suffix_full_field_from_u64(scalar));
-                if (chunk == 0) {
-                    solinas_lazy_add(chunk_zero[suffix], contribution);
-                } else {
-                    address_suffix_full_atomic_add(
-                        sums,
-                        suffix * ADDRESS_SUFFIX_FULL_BINS + chunk,
-                        contribution);
-                }
+            if (chunk == 0) {
+                solinas_lazy_add(raf_zero[output_lane], raf[output_lane]);
+            } else {
+                solinas_deferred_atomic_add_5(
+                    sums, chunk * ADDRESS_RAF_DIRECT_LANES + output_lane, raf[output_lane]);
             }
         }
+        address_phase_add_suffixes<0, ADDRESS_PHASE_SUFFIX_SLOTS>(
+            sums, suffix_zero, kinds, suffix_count, ADDRESS_PHASE_RAF_FIELDS, bits, chunk, weight);
     }
-    for (uint suffix = 0; suffix < ADDRESS_SUFFIX_FULL_MAX_SUFFIXES; suffix++) {
-        if (suffix < suffix_count) {
-            solinas_deferred_atomic_flush_simd(
-                sums, suffix * ADDRESS_SUFFIX_FULL_BINS, chunk_zero[suffix], lane);
-        }
+    for (uint output_lane = 0; output_lane < ADDRESS_RAF_DIRECT_LANES; output_lane++) {
+        solinas_deferred_atomic_flush_simd(sums, output_lane, raf_zero[output_lane], lane);
     }
+    address_phase_flush_suffixes<0, ADDRESS_PHASE_SUFFIX_SLOTS>(
+        sums, suffix_zero, suffix_count, ADDRESS_PHASE_RAF_FIELDS, lane);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint output_base = job_index * ADDRESS_SUFFIX_FULL_FIELDS;
-    for (uint field = tid; field < ADDRESS_SUFFIX_FULL_FIELDS; field += threads) {
-        partials[output_base + field] = address_suffix_full_reduce_atomic_sum(sums, field);
+    // The RAF finalize sums whole [job][flag][chunk][lane] blocks, so the
+    // other flag's half is written as zero.
+    uint raf_base = job_index * ADDRESS_RAF_DIRECT_FIELDS;
+    uint own_half = job.raf_flag * ADDRESS_PHASE_RAF_FIELDS;
+    uint other_half = ADDRESS_PHASE_RAF_FIELDS - own_half;
+    for (uint field = tid; field < ADDRESS_PHASE_RAF_FIELDS; field += threads) {
+        raf_partials[raf_base + own_half + field] = solinas_deferred_atomic_reduce_5(sums, field);
+        raf_partials[raf_base + other_half + field] = solinas_zero();
+    }
+    uint suffix_base = job_index * ADDRESS_SUFFIX_FULL_FIELDS;
+    uint low_fields = min(suffix_count, ADDRESS_PHASE_SUFFIX_SLOTS) * ADDRESS_SUFFIX_FULL_BINS;
+    for (uint field = tid; field < low_fields; field += threads) {
+        suffix_partials[suffix_base + field] =
+            solinas_deferred_atomic_reduce_5(sums, ADDRESS_PHASE_RAF_FIELDS + field);
+    }
+    if (suffix_count <= ADDRESS_PHASE_SUFFIX_SLOTS) {
+        return;
+    }
+
+    // Tables with more suffixes than one pass holds re-read their rows (and
+    // this thread's condensed weights) for the remaining slots.
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint counter = tid;
+         counter < ADDRESS_PHASE_HIGH_SLOTS * ADDRESS_SUFFIX_FULL_BINS * SOLINAS_DEFERRED_SUM_WORDS;
+         counter += threads) {
+        atomic_store_explicit(&sums[counter], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    SolinasLazySum high_zero[ADDRESS_PHASE_HIGH_SLOTS];
+    for (uint slot = 0; slot < ADDRESS_PHASE_HIGH_SLOTS; slot++) {
+        high_zero[slot] = solinas_lazy_zero();
+    }
+    for (uint row = job.start + tid; row < job.end; row += threads) {
+        AddressSuffixFullLookup lookup = lookups[row];
+        address_phase_add_suffixes<ADDRESS_PHASE_SUFFIX_SLOTS, ADDRESS_PHASE_HIGH_SLOTS>(
+            sums,
+            high_zero,
+            kinds,
+            suffix_count,
+            0,
+            address_suffix_full_bits(lookup, params.suffix_len),
+            address_suffix_full_lookup_byte(lookup, params.suffix_len),
+            weights[row]);
+    }
+    address_phase_flush_suffixes<ADDRESS_PHASE_SUFFIX_SLOTS, ADDRESS_PHASE_HIGH_SLOTS>(
+        sums, high_zero, suffix_count, 0, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint high_fields = (suffix_count - ADDRESS_PHASE_SUFFIX_SLOTS) * ADDRESS_SUFFIX_FULL_BINS;
+    for (uint field = tid; field < high_fields; field += threads) {
+        suffix_partials[suffix_base + low_fields + field] =
+            solinas_deferred_atomic_reduce_5(sums, field);
     }
 }
 

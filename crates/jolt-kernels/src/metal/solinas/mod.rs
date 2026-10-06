@@ -369,10 +369,6 @@ pub enum MetalError {
         maximum: usize,
     },
     #[error(
-        "address suffix kernel needs {requested} bytes of threadgroup memory, device limit is {maximum}"
-    )]
-    AddressSuffixThreadgroupMemory { requested: u64, maximum: u64 },
-    #[error(
         "address RAF pipeline `{pipeline}` requires SIMD width {expected}, but the device reports {got}"
     )]
     UnsupportedAddressRafExecutionWidth {
